@@ -24,6 +24,10 @@ dependencies = [
   "triton",
 ]
 
+[project.optional-dependencies]
+# Problem 92 (NIXL one-sided READ). Linux + CUDA 12 only: `uv sync --extra nixl`.
+nixl = ["nixl-cu12>=1.5.0; sys_platform == 'linux'"]
+
 [tool.uv]
 default-groups = []
 
@@ -77,6 +81,9 @@ run = [
   # Clone ThunderKittens (parallelkittens backend headers)
   "git clone --depth 1 https://github.com/HazyResearch/ThunderKittens.git /opt/thunderkittens",
 
+  # NIXL (problem 92); optional extra, so install it explicitly in the image
+  "pip install 'nixl-cu12>=1.5.0'",
+
 ]
 
 # Image-level environment variables
@@ -88,6 +95,8 @@ PATH = "/usr/local/cuda/bin:/usr/bin:$PATH"
 CC = "/usr/bin/gcc"
 # Hopper-only JIT (see scripts/worker.py); avoids nvcc fat-binary sm_75 passes on Hopper-only sources.
 TORCH_CUDA_ARCH_LIST = "9.0"
+# UCX transports for NIXL (problem 92) on a single NVLink node.
+UCX_TLS = "cuda_ipc,cuda_copy,tcp"
 
 # ---------------------------------------------------------------------------
 # Deployment configuration
