@@ -96,7 +96,7 @@ CC = "/usr/bin/gcc"
 # Hopper-only JIT (see scripts/worker.py); avoids nvcc fat-binary sm_75 passes on Hopper-only sources.
 TORCH_CUDA_ARCH_LIST = "9.0"
 # UCX transports for NIXL (problem 92) on a single NVLink node.
-UCX_TLS = "cuda_ipc,cuda_copy,tcp"
+UCX_TLS = "cuda_ipc,cuda_copy,sm,self"
 
 # ---------------------------------------------------------------------------
 # Deployment configuration

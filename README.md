@@ -64,9 +64,12 @@ Problem 92 (`92_kv_cache_redistribution_head_to_seq_nixl`) moves data with [NIXL
 
 ```bash
 uv sync --extra nixl
-# single-node NVLink transports (the reference also sets this by default)
-export UCX_TLS=cuda_ipc,cuda_copy,tcp
+# single node: NVLink (cuda_ipc) for data, shared memory for UCX control traffic
+# (the reference sets this by default; tcp is unavailable in some containers, e.g. Modal)
+export UCX_TLS=cuda_ipc,cuda_copy,sm,self
 ```
+
+The reference creates its UCX backend with `ucx_error_handling_mode="none"`. Peer error handling needs a network transport (tcp or IB), and without one NIXL fails to create the backend with `NIXL_ERR_BACKEND`.
 
 The Modal and Together images install `nixl-cu12` and set `UCX_TLS`. Candidate solutions may use any transport (NIXL, NCCL, NVSHMEM, CUDA IPC); only the outputs are compared.
 

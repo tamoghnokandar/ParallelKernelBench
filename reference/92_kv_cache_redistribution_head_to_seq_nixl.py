@@ -26,9 +26,14 @@ def _import_nixl():
 def _get_state(global_rank: int) -> dict:
     state = _NIXL_STATE.get(global_rank)
     if state is None:
-        os.environ.setdefault("UCX_TLS", "cuda_ipc,cuda_copy,tcp")
+        os.environ.setdefault("UCX_TLS", "cuda_ipc,cuda_copy,sm,self")
         nixl_agent, nixl_agent_config = _import_nixl()
-        agent = nixl_agent(f"pkb_rank{global_rank}", nixl_agent_config(backends=["UCX"]))
+        agent = nixl_agent(f"pkb_rank{global_rank}", nixl_agent_config(backends=[]))
+        # Single-node pull: no peer-failure reporting, which lets UCX use shared memory for its
+        # control traffic (peer error handling needs a network transport such as tcp or IB).
+        params = agent.get_plugin_params("UCX")
+        params["ucx_error_handling_mode"] = "none"
+        agent.create_backend("UCX", params)
         state = {
             "agent": agent,
             "key": None,
