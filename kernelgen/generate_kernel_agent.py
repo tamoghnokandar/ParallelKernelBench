@@ -200,6 +200,18 @@ def _apply_together_api_key(args: argparse.Namespace) -> None:
     os.environ.setdefault("TOGETHERAI_API_KEY", key)
 
 
+def _require_openrouter_key_if_needed(model: str) -> None:
+    """LiteLLM routes ``openrouter/<org>/<model>`` to OpenRouter using OPENROUTER_API_KEY."""
+    if not model.startswith("openrouter/") or os.environ.get("OPENROUTER_API_KEY"):
+        return
+    print(
+        "Error: OpenRouter models need an API key. Set environment variable OPENROUTER_API_KEY "
+        "(LiteLLM uses it for model names starting with openrouter/).",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
 def _require_together_key_if_needed(model: str) -> None:
     if not model.startswith("together_ai/"):
         return
@@ -405,7 +417,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "LiteLLM model id (default: MSWEA_MODEL_NAME). "
             "Together AI: together_ai/<model> (or together/<model>, normalized); "
-            "set TOGETHER_API_KEY or --together-api-key."
+            "set TOGETHER_API_KEY or --together-api-key. "
+            "OpenRouter: openrouter/<org>/<model>; set OPENROUTER_API_KEY."
         ),
     )
     p.add_argument(
@@ -543,6 +556,7 @@ def run_agent(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
         return 0
 
     _require_together_key_if_needed(args.model)
+    _require_openrouter_key_if_needed(args.model)
 
     try:
         from minisweagent.config import get_config_from_spec

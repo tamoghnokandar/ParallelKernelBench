@@ -3,7 +3,7 @@
 Kernel generation CLI: assembles the user prompt and optionally calls an LLM.
 
 Generated files are written under a run-specific folder at the repo root so runs with different settings do not overwrite each other, e.g.
-``solutions_{backend}_{precision}_{hardware|none}_{google|together}_{model_slug}/``
+``solutions_{backend}_{precision}_{hardware|none}_{provider}_{model_slug}/``
 
 Flags:
   --print-prompt     Print the full assembled prompt to stdout.
@@ -12,7 +12,8 @@ Flags:
   --hardware         Hardware topology (info to pass to the prompt)
   --backend          Backend (e.g. cuda, parallelkittens, triton)
   --paths-to-prompts-template   Path to prompts.toml.
-  --model            Must be one of ALLOWED_MODELS (Gemini, Together, Anthropic, or OpenAI).
+  --model            One of ALLOWED_MODELS (Gemini, Together, Anthropic, or OpenAI), or any OpenRouter
+                     model as openrouter/<org>/<model> (e.g. openrouter/anthropic/claude-opus-4.5).
 
 Environment:
   PROBLEM_DIR                        When --problem all: directory of *.py stems (default: reference/).
@@ -20,13 +21,17 @@ Environment:
   TOGETHER_API_KEY                   For Together models.
   ANTHROPIC_API_KEY                  For Anthropic models.
   OPENAI_API_KEY                     For OpenAI models.
+  OPENROUTER_API_KEY                 For openrouter/... models.
   TOGETHER_MAX_TOKENS                Optional max output tokens for Together chat completions (default 100000)
   OPENAI_MAX_TOKENS                  Optional max output tokens for OpenAI chat completions (default 100000)
   ANTHROPIC_MAX_TOKENS               Optional max output tokens for Anthropic chat completions (default 100000)
+  OPENROUTER_MAX_TOKENS              Optional max output tokens for OpenRouter chat completions (default 100000;
+                                     must be below the model's context length)
   LLM_MAX_TOKENS                     Fallback max output tokens for chat providers when a provider-specific var is unset.
   TOGETHER_TIMEOUT_SECS              Optional HTTP read timeout in seconds for each Together chat completion (default 3600).
   OPENAI_TIMEOUT_SECS                Optional HTTP read timeout in seconds for each OpenAI chat completion (default 3600).
   ANTHROPIC_TIMEOUT_SECS             Optional HTTP read timeout in seconds for each Anthropic chat completion (default 3600).
+  OPENROUTER_TIMEOUT_SECS            Optional HTTP read timeout in seconds for each OpenRouter chat completion (default 3600).
 """
 
 from __future__ import annotations
@@ -51,7 +56,7 @@ _PROMPTS_TOML = Path(__file__).resolve().parent / "prompts.toml"
 _PRECISION_CHOICES = ("fp32", "fp16", "bf16")
 _HARDWARE_CHOICES = ("h100_8", "b200_72")
 
-Provider = Literal["google", "together", "anthropic", "openai"]
+Provider = Literal["google", "together", "anthropic", "openai", "openrouter"]
 
 # Curated allowlist: --model must be a key. Value is the API backend.
 ALLOWED_MODELS: dict[str, Provider] = {
@@ -68,6 +73,16 @@ ALLOWED_MODELS: dict[str, Provider] = {
 }
 
 _DEFAULT_MODEL = "gemini-2.5-flash"
+
+# Any OpenRouter model can be used as openrouter/<org>/<model>, outside the allowlist.
+_OPENROUTER_PREFIX = "openrouter/"
+_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+
+def _provider_for_model(model: str) -> Provider | None:
+    if model.startswith(_OPENROUTER_PREFIX) and len(model) > len(_OPENROUTER_PREFIX):
+        return "openrouter"
+    return ALLOWED_MODELS.get(model)
 
 # Chat providers apply a server default max output length when ``max_tokens`` is omitted.
 # Long CUDA/TK sources then stop mid-file (finish_reason=length).
@@ -187,8 +202,8 @@ def output_run_dir_relative(
     Pattern: solutions_<backend>_<precision>_<hardware|none>_<provider>_<model_slug>
     """
     hw = hardware if hardware else "none"
-    prov = ALLOWED_MODELS[model]
-    mslug = _slug_model_for_path(model)
+    prov = _provider_for_model(model)
+    mslug = _slug_model_for_path(model.removeprefix(_OPENROUTER_PREFIX))
     return f"solutions_{backend}_{precision}_{hw}_{prov}_{mslug}"
 
 
@@ -473,11 +488,48 @@ def _call_openai(model: str, user_prompt: str, system_prompt: str) -> str:
         raise RuntimeError("OpenAI returned empty response.")
     return raw
 
+def _call_openrouter(model: str, user_prompt: str, system_prompt: str) -> str:
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("set OPENROUTER_API_KEY for openrouter/... models.")
+    try:
+        from openai import OpenAI
+    except ImportError as e:
+        raise RuntimeError("pip install openai") from e
+
+    # OpenRouter exposes an OpenAI-compatible chat completions API.
+    client = OpenAI(
+        base_url=_OPENROUTER_BASE_URL,
+        api_key=api_key,
+        timeout=_chat_timeout_sec("OPENROUTER_TIMEOUT_SECS"),
+    )
+    response = client.chat.completions.create(
+        model=model.removeprefix(_OPENROUTER_PREFIX),
+        max_tokens=_chat_max_tokens("OPENROUTER_MAX_TOKENS"),
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    if not response.choices:
+        raise RuntimeError(f"OpenRouter returned no choices: {response!r}")
+    choice = response.choices[0]
+    msg = choice.message
+    raw = (getattr(msg, "content", None) or "") if msg is not None else ""
+    raw = raw.strip() if isinstance(raw, str) else ""
+    if not raw:
+        raise RuntimeError(
+            f"OpenRouter returned empty response (finish_reason={choice.finish_reason!r})."
+        )
+    return raw
+
+
 def _complete_model(model: str, user_prompt: str, system_prompt: str) -> str:
-    provider = ALLOWED_MODELS.get(model)
+    provider = _provider_for_model(model)
     if provider is None:
         raise RuntimeError(
-            f"unknown model {model!r}. Allowed: {', '.join(sorted(ALLOWED_MODELS))}"
+            f"unknown model {model!r}. Allowed: {', '.join(sorted(ALLOWED_MODELS))}, "
+            "or openrouter/<org>/<model>"
         )
     if provider == "google":
         return _call_gemini(model, user_prompt, system_prompt)
@@ -485,6 +537,8 @@ def _complete_model(model: str, user_prompt: str, system_prompt: str) -> str:
         return _call_anthropic(model, user_prompt, system_prompt)
     if provider == "openai":
         return _call_openai(model, user_prompt, system_prompt)
+    if provider == "openrouter":
+        return _call_openrouter(model, user_prompt, system_prompt)
     return _call_together(model, user_prompt, system_prompt)
 
 
@@ -554,16 +608,19 @@ def parse_args(argv: list[str] | None = None) -> KernelGenArgs:
         "--model",
         default=_DEFAULT_MODEL,
         metavar="NAME",
-        help=f"Model id (must be one of: {allowed_help}). Ignored with --print-prompt.",
+        help=(
+            f"Model id: one of {allowed_help}, or any OpenRouter model as "
+            "openrouter/<org>/<model>. Ignored with --print-prompt."
+        ),
     )
     ns = parser.parse_args(argv)
 
 
     # Check that are args are valid:
     model = str(ns.model)                           # make sure model is allowed
-    if model not in ALLOWED_MODELS:
+    if _provider_for_model(model) is None:
         print(
-            f"Error: --model must be one of: {allowed_help}",
+            f"Error: --model must be one of: {allowed_help}, or openrouter/<org>/<model>",
             file=sys.stderr,
         )
         raise SystemExit(1)
@@ -632,7 +689,7 @@ def generate_kernel(
         return
 
     print(
-        f"Calling {ALLOWED_MODELS[args.model]} (model={args.model}) for problem {stem}...",
+        f"Calling {_provider_for_model(args.model)} (model={args.model}) for problem {stem}...",
         flush=True,
     )
     sys_prompt = system_prompt_for_backend(cfg, args.backend)
