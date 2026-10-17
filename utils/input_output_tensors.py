@@ -58,6 +58,10 @@ def _seed(problem_id: int, rank: int, trial: int = 0) -> None:
     """trial varies RNG across eval runs; trial=0 matches the historical single-run seed."""
     torch.manual_seed(42 + problem_id * 1000 + rank + trial * 1_000_003)
 
+def _shared_generator(problem_id: int, trial: int = 0) -> torch.Generator:
+    """CPU generator seeded identically on every rank (for data that must agree across ranks)."""
+    return torch.Generator().manual_seed(42 + problem_id * 1000 + trial * 1_000_003 + 777)
+
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def _round_up_multiple(n: int, m: int) -> int:
@@ -280,7 +284,7 @@ def create_input_tensor(
     Args:
         rank: Process rank (0..world_size-1)
         world_size: Total number of processes
-        problem_id: Problem ID (e.g. 1–87) from reference filename
+        problem_id: Problem ID (e.g. 1–92) from reference filename
         base_shape: Base tensor shape tuple (e.g., (M, N))
         dtype: Tensor data type
         trial: Non-negative index; changes RNG for problems that use random inputs (trial=0 is legacy behavior).
@@ -1874,6 +1878,151 @@ def create_input_tensor(
             bias.contiguous(),
             1,
             padding,
+            None,
+        )
+
+    # 88: eplb_expert_weight_migration
+    elif problem_id == 88:
+        _seed(problem_id, rank, trial)
+        num_local_experts = 8
+        num_experts = num_local_experts * world_size
+        hidden = N
+        inter = max(1, M // 2)
+        # Placement plans are identical on every rank.
+        gen = _shared_generator(problem_id, trial)
+        old_indices = torch.randperm(num_experts, generator=gen)
+        if trial % 3 == 2:
+            # Sparse plan: swap one expert on the first rank with one on the last rank.
+            a = int(torch.randint(0, num_local_experts, (1,), generator=gen))
+            b = (world_size - 1) * num_local_experts + int(
+                torch.randint(0, num_local_experts, (1,), generator=gen)
+            )
+            new_indices = old_indices.clone()
+            new_indices[a], new_indices[b] = old_indices[b], old_indices[a]
+        else:
+            new_indices = torch.randperm(num_experts, generator=gen)
+        # Each weight encodes (expert_id, h, i) as a small integer, exact in bf16.
+        local_experts = old_indices[rank * num_local_experts:(rank + 1) * num_local_experts]
+        e = local_experts.to(dev).view(-1, 1, 1)
+        h = torch.arange(hidden, device=dev).view(1, -1, 1)
+        i = torch.arange(inter, device=dev).view(1, 1, -1)
+        expert_weights = ((e * 131 + h * 7 + i * 3) % 256).to(dtype)
+        return (
+            expert_weights.contiguous(),
+            old_indices.to(dev),
+            new_indices.to(dev),
+            None,
+        )
+
+    # 89: rl_weight_resharding_fsdp_to_tp
+    elif problem_id == 89:
+        _seed(problem_id, rank, trial)
+        hidden = N
+        ffn = _round_up_multiple(4 * N, world_size)
+        num_q_heads, num_kv_heads, head_dim = 32, 8, 128
+        assert num_kv_heads % world_size == 0, "num_kv_heads must be divisible by world_size"
+        assert hidden % world_size == 0, "hidden must be divisible by world_size"
+        qkv_rows = (num_q_heads + 2 * num_kv_heads) * head_dim
+        qkv_shard = torch.randn((qkv_rows // world_size, hidden), dtype=dtype, device=dev)
+        gate_up_shard = torch.randn((2 * ffn // world_size, hidden), dtype=dtype, device=dev)
+        down_shard = torch.randn((hidden // world_size, ffn), dtype=dtype, device=dev)
+        return (
+            qkv_shard,
+            gate_up_shard,
+            down_shard,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            None,
+        )
+
+    # 90: cp_decode_lse_merge
+    elif problem_id == 90:
+        _seed(problem_id, rank, trial)
+        batch, page, num_q_heads, num_kv_heads, head_dim = 8, 16, 32, 8, 128
+        assert num_q_heads % world_size == 0
+        max_len = 4096
+        max_blocks = max_len // page
+        # q is the same decode token on every rank.
+        gen = _shared_generator(problem_id, trial)
+        q = torch.randn((batch, num_q_heads, head_dim), generator=gen).to(dtype=dtype, device=dev)
+        # Uneven per-rank context shards; batch entries 0, 3, 6 are empty on one rank (lse = -inf).
+        seq_lens = torch.randint(1, max_len + 1, (batch,))
+        for b in range(0, batch, 3):
+            if b % world_size == rank:
+                seq_lens[b] = 0
+        blocks_per_seq = (seq_lens + page - 1) // page
+        num_blocks = int(blocks_per_seq.sum()) + 32
+        pool = torch.randperm(num_blocks)
+        block_table = torch.zeros((batch, max_blocks), dtype=torch.int32)
+        offset = 0
+        for b in range(batch):
+            nb = int(blocks_per_seq[b])
+            block_table[b, :nb] = pool[offset:offset + nb].to(torch.int32)
+            offset += nb
+        k_cache = torch.randn((num_blocks, page, num_kv_heads, head_dim), dtype=dtype, device=dev)
+        v_cache = torch.randn((num_blocks, page, num_kv_heads, head_dim), dtype=dtype, device=dev)
+        return (
+            q.contiguous(),
+            k_cache,
+            v_cache,
+            block_table.to(dev),
+            seq_lens.to(torch.int32).to(dev),
+            head_dim ** -0.5,
+            None,
+        )
+
+    # 91: sync_batchnorm_fwd_bwd
+    elif problem_id == 91:
+        _seed(problem_id, rank, trial)
+        channels = max(1, N // 8)
+        height = width = 32
+        n_local = int(torch.randint(2, 9, (1,)))
+        x = torch.randn((n_local, channels, height, width), dtype=torch.float32, device=dev)
+        x = (x * 2.0 + 0.5).to(dtype)
+        grad_out = torch.randn((n_local, channels, height, width), dtype=dtype, device=dev)
+        gen = _shared_generator(problem_id, trial)
+        weight = (1.0 + 0.1 * torch.randn(channels, generator=gen)).to(dtype=dtype, device=dev)
+        bias = (0.1 * torch.randn(channels, generator=gen)).to(dtype=dtype, device=dev)
+        return (x.contiguous(), grad_out.contiguous(), weight, bias, 1e-5, None)
+
+    # 92: kv_cache_redistribution_head_to_seq_nixl
+    elif problem_id == 92:
+        _seed(problem_id, rank, trial)
+        num_heads, head_dim, page = 8, 128, 16
+        assert num_heads % world_size == 0, "num_heads must be divisible by world_size"
+        local_heads = num_heads // world_size
+        num_logical = 64 * world_size
+        # Validity and sequence-sharded destination placement are identical on every rank.
+        gen = _shared_generator(problem_id, trial)
+        valid_idx = (torch.rand(num_logical, generator=gen) < 0.75).nonzero().flatten()
+        num_valid = valid_idx.numel()
+        per_rank = (num_valid + world_size - 1) // world_size
+        num_dst_pages = per_rank + 4
+        dst_block_table = torch.full((num_logical, 2), -1, dtype=torch.int64)
+        for r in range(world_size):
+            chunk = valid_idx[r * per_rank:(r + 1) * per_rank]
+            slots = torch.randperm(num_dst_pages, generator=gen)[:chunk.numel()]
+            dst_block_table[chunk, 0] = r
+            dst_block_table[chunk, 1] = slots
+        # Fragmented per-rank source page pool; unused pages hold noise.
+        num_src_pages = num_logical + 16
+        pages = torch.randperm(num_src_pages)[:num_valid]
+        src_block_table = torch.full((num_logical,), -1, dtype=torch.int64)
+        src_block_table[valid_idx] = pages
+        kv_pages = torch.randn((num_src_pages, page, local_heads, head_dim), dtype=dtype, device=dev)
+        # Each element encodes (logical_block, token, head, dim) as an integer in [-125, 125].
+        lb = valid_idx.to(dev).view(-1, 1, 1, 1)
+        t = torch.arange(page, device=dev).view(1, -1, 1, 1)
+        h = (rank * local_heads + torch.arange(local_heads, device=dev)).view(1, 1, -1, 1)
+        dd = torch.arange(head_dim, device=dev).view(1, 1, 1, -1)
+        vals = (lb * 37 + t * 11 + h * 13 + dd * 3 + trial * 7) % 251 - 125
+        kv_pages[pages.to(dev)] = vals.to(dtype)
+        return (
+            kv_pages.contiguous(),
+            src_block_table.to(dev),
+            dst_block_table.to(dev),
+            num_dst_pages,
             None,
         )
 

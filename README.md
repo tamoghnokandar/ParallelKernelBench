@@ -58,6 +58,21 @@ uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available
 
 This creates `.venv/` at the repo root and installs all dependencies from the pinned `uv.lock` (commit that file when you change `pyproject.toml`).
 
+### Optional: NIXL (problem 92)
+
+Problem 92 (`92_kv_cache_redistribution_head_to_seq_nixl`) moves data with [NIXL](https://github.com/ai-dynamo/nixl) one-sided READs over UCX. NIXL is an optional extra and other problems don't need it; without it, problem 92 raises an `ImportError` that explains how to install it.
+
+```bash
+uv sync --extra nixl
+# single node: NVLink (cuda_ipc) for data, shared memory for UCX control traffic
+# (the reference sets this by default; tcp is unavailable in some containers, e.g. Modal)
+export UCX_TLS=cuda_ipc,cuda_copy,sm,self
+```
+
+The reference creates its UCX backend with `ucx_error_handling_mode="none"`. Peer error handling needs a network transport (tcp or IB), and without one NIXL fails to create the backend with `NIXL_ERR_BACKEND`.
+
+The Modal and Together images install `nixl-cu12` and set `UCX_TLS`. Candidate solutions may use any transport (NIXL, NCCL, NVSHMEM, CUDA IPC); only the outputs are compared.
+
 ### API keys (generation / cloud eval)
 
 - Google models: `GEMINI_API_KEY` or `GOOGLE_API_KEY`.
@@ -291,6 +306,20 @@ This started as an internship project: we would greatly welcome contributions!
 3. The current infra assumes we have a single `.py` file per solution.
 
 
+
+### Problems 88–92
+
+These problems are adapted from production PyTorch + NCCL code (sources are listed in the PR that added them). They target 2–4 GPUs.
+
+| ID | Problem | Output | Tolerance |
+| --- | --- | --- | --- |
+| 88 | EPLB expert-weight migration (vLLM `rearrange_expert_weights_inplace`) | `[E/world, H, I]` new local experts | exact |
+| 89 | RL weight resharding, FSDP → TP (verl / slime / vLLM `weight_loader`) | flat TP shard of QKV, gate/up, and down | exact |
+| 90 | Context-parallel decode LSE merge (vLLM `cp_lse_ag_out_rs`) | `[B, Hq/world, d]` | ~1e-2 |
+| 91 | SyncBatchNorm forward + backward (`torch.nn.SyncBatchNorm`) | `cat(y, grad_x, grad_w, grad_b)` | ~1e-2 |
+| 92 | KV-cache redistribution from head-sharded to sequence-sharded layout via NIXL READ | `[num_dst_pages, page, H, d]` | exact |
+
+For the exact problems, run eval with `--atol 0 --rtol 0`.
 
 ### Adding a problem
 

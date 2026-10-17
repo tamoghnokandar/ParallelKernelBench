@@ -101,7 +101,9 @@ image = (
         "cuda-python>=12.0",
         "cffi",
         "ninja",  # required for torch's load_inline
+        "nixl-cu12",  # problem 92 (NIXL one-sided READ)
     )
+    .env({"UCX_TLS": "cuda_ipc,cuda_copy,sm,self"})
     # Clone ThunderKittens (parallelkittens backend headers)
     .run_commands(
         "git clone --depth 1 https://github.com/HazyResearch/ThunderKittens.git /opt/thunderkittens",
