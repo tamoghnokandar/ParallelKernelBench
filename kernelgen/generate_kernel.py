@@ -503,23 +503,33 @@ def _call_openrouter(model: str, user_prompt: str, system_prompt: str) -> str:
         api_key=api_key,
         timeout=_chat_timeout_sec("OPENROUTER_TIMEOUT_SECS"),
     )
-    response = client.chat.completions.create(
+    # Stream: a long non-streamed generation sends no bytes until it finishes and can hang
+    # the connection; with streaming, OpenRouter also sends keep-alives while it works.
+    stream = client.chat.completions.create(
         model=model.removeprefix(_OPENROUTER_PREFIX),
         max_tokens=_chat_max_tokens("OPENROUTER_MAX_TOKENS"),
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
+        stream=True,
     )
-    if not response.choices:
-        raise RuntimeError(f"OpenRouter returned no choices: {response!r}")
-    choice = response.choices[0]
-    msg = choice.message
-    raw = (getattr(msg, "content", None) or "") if msg is not None else ""
-    raw = raw.strip() if isinstance(raw, str) else ""
+    parts: list[str] = []
+    finish_reason = None
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        choice = chunk.choices[0]
+        if choice.delta is not None and choice.delta.content:
+            parts.append(choice.delta.content)
+        if choice.finish_reason:
+            finish_reason = choice.finish_reason
+    if finish_reason == "error":
+        raise RuntimeError("OpenRouter stream ended with finish_reason='error'.")
+    raw = "".join(parts).strip()
     if not raw:
         raise RuntimeError(
-            f"OpenRouter returned empty response (finish_reason={choice.finish_reason!r})."
+            f"OpenRouter returned empty response (finish_reason={finish_reason!r})."
         )
     return raw
 
