@@ -64,7 +64,7 @@ This creates `.venv/` at the repo root and installs all dependencies from the pi
 - Together models: `TOGETHER_API_KEY` (see `ALLOWED_MODELS` in `kernelgen/generate_kernel.py`).
 - Anthropic models: `ANTHROPIC_API_KEY`.
 - OpenAI models: `OPENAI_API_KEY`.
-- OpenRouter models: `OPENROUTER_API_KEY`. Pass any [OpenRouter model](https://openrouter.ai/models) as `--model openrouter/<org>/<model>` (e.g. `openrouter/anthropic/claude-opus-4.5`) to either `generate_kernel.py` or `generate_kernel_agent.py`. `generate_kernel.py` requests 100000 output tokens by default; for models with a smaller context window, set `OPENROUTER_MAX_TOKENS` below the model's context length.
+- OpenRouter models: `OPENROUTER_API_KEY`. Pass any [OpenRouter model](https://openrouter.ai/models) as `--model openrouter/<org>/<model>` (e.g. `openrouter/anthropic/claude-opus-4.5`) to either `generate_kernel.py` or `generate_kernel_agent.py`. `generate_kernel.py` requests 100000 output tokens by default; for models with a smaller context window, set `OPENROUTER_MAX_TOKENS` below the model's context length. Responses are streamed, and a stream that goes silent for `OPENROUTER_TIMEOUT_SECS` (default 120) is treated as stalled and retried, up to `OPENROUTER_ATTEMPTS` attempts (default 3).
 
 ---
 

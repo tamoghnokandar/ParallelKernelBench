@@ -31,7 +31,10 @@ Environment:
   TOGETHER_TIMEOUT_SECS              Optional HTTP read timeout in seconds for each Together chat completion (default 3600).
   OPENAI_TIMEOUT_SECS                Optional HTTP read timeout in seconds for each OpenAI chat completion (default 3600).
   ANTHROPIC_TIMEOUT_SECS             Optional HTTP read timeout in seconds for each Anthropic chat completion (default 3600).
-  OPENROUTER_TIMEOUT_SECS            Optional HTTP read timeout in seconds for each OpenRouter chat completion (default 3600).
+  OPENROUTER_TIMEOUT_SECS            Optional per-read timeout in seconds for OpenRouter streams (default 120); a stream
+                                     silent for this long is treated as stalled and retried.
+  OPENROUTER_ATTEMPTS                Optional number of attempts per OpenRouter call, including retries after a stalled
+                                     or dropped stream (default 3).
 """
 
 from __future__ import annotations
@@ -77,6 +80,8 @@ _DEFAULT_MODEL = "gemini-2.5-flash"
 # Any OpenRouter model can be used as openrouter/<org>/<model>, outside the allowlist.
 _OPENROUTER_PREFIX = "openrouter/"
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+_OPENROUTER_DEFAULT_TIMEOUT_SEC = 120.0
+_OPENROUTER_DEFAULT_ATTEMPTS = 3
 
 
 def _provider_for_model(model: str) -> Provider | None:
@@ -112,7 +117,7 @@ def _chat_max_tokens(provider_env_var: str) -> int:
     return _CHAT_DEFAULT_MAX_TOKENS
 
 
-def _chat_timeout_sec(provider_env_var: str) -> float:
+def _chat_timeout_sec(provider_env_var: str, default: float = _CHAT_DEFAULT_TIMEOUT_SEC) -> float:
     raw = os.environ.get(provider_env_var, "").strip()
     if raw:
         try:
@@ -121,7 +126,17 @@ def _chat_timeout_sec(provider_env_var: str) -> float:
             raise ValueError(
                 f"{provider_env_var} must be a positive number, got {raw!r}"
             ) from None
-    return _CHAT_DEFAULT_TIMEOUT_SEC
+    return default
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}") from None
 
 
 def _together_max_tokens() -> int:
@@ -488,23 +503,9 @@ def _call_openai(model: str, user_prompt: str, system_prompt: str) -> str:
         raise RuntimeError("OpenAI returned empty response.")
     return raw
 
-def _call_openrouter(model: str, user_prompt: str, system_prompt: str) -> str:
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        raise RuntimeError("set OPENROUTER_API_KEY for openrouter/... models.")
-    try:
-        from openai import OpenAI
-    except ImportError as e:
-        raise RuntimeError("pip install openai") from e
-
-    # OpenRouter exposes an OpenAI-compatible chat completions API.
-    client = OpenAI(
-        base_url=_OPENROUTER_BASE_URL,
-        api_key=api_key,
-        timeout=_chat_timeout_sec("OPENROUTER_TIMEOUT_SECS"),
-    )
+def _openrouter_stream_once(client: Any, model: str, user_prompt: str, system_prompt: str) -> str:
     # Stream: a long non-streamed generation sends no bytes until it finishes and can hang
-    # the connection; with streaming, OpenRouter also sends keep-alives while it works.
+    # the connection; with streaming, chunks arrive every few seconds.
     stream = client.chat.completions.create(
         model=model.removeprefix(_OPENROUTER_PREFIX),
         max_tokens=_chat_max_tokens("OPENROUTER_MAX_TOKENS"),
@@ -516,14 +517,17 @@ def _call_openrouter(model: str, user_prompt: str, system_prompt: str) -> str:
     )
     parts: list[str] = []
     finish_reason = None
-    for chunk in stream:
-        if not chunk.choices:
-            continue
-        choice = chunk.choices[0]
-        if choice.delta is not None and choice.delta.content:
-            parts.append(choice.delta.content)
-        if choice.finish_reason:
-            finish_reason = choice.finish_reason
+    try:
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if choice.delta is not None and choice.delta.content:
+                parts.append(choice.delta.content)
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+    finally:
+        stream.close()
     if finish_reason == "error":
         raise RuntimeError("OpenRouter stream ended with finish_reason='error'.")
     raw = "".join(parts).strip()
@@ -532,6 +536,35 @@ def _call_openrouter(model: str, user_prompt: str, system_prompt: str) -> str:
             f"OpenRouter returned empty response (finish_reason={finish_reason!r})."
         )
     return raw
+
+
+def _call_openrouter(model: str, user_prompt: str, system_prompt: str) -> str:
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("set OPENROUTER_API_KEY for openrouter/... models.")
+    try:
+        from openai import APIConnectionError, OpenAI
+    except ImportError as e:
+        raise RuntimeError("pip install openai") from e
+
+    # OpenRouter exposes an OpenAI-compatible chat completions API. The timeout applies per
+    # read, and a healthy stream delivers data every few seconds, so a short timeout detects
+    # a stream that has stalled mid-generation (seen in practice: connection left open, no data).
+    client = OpenAI(
+        base_url=_OPENROUTER_BASE_URL,
+        api_key=api_key,
+        timeout=_chat_timeout_sec("OPENROUTER_TIMEOUT_SECS", default=_OPENROUTER_DEFAULT_TIMEOUT_SEC),
+    )
+    attempts = _positive_int_env("OPENROUTER_ATTEMPTS", _OPENROUTER_DEFAULT_ATTEMPTS)
+    for attempt in range(1, attempts + 1):
+        try:
+            return _openrouter_stream_once(client, model, user_prompt, system_prompt)
+        except APIConnectionError as e:  # includes APITimeoutError (stalled stream)
+            if attempt == attempts:
+                raise RuntimeError(f"OpenRouter failed after {attempts} attempts: {e}") from e
+            print(f"  OpenRouter attempt {attempt}/{attempts} failed ({e}); retrying...",
+                  file=sys.stderr, flush=True)
+    raise AssertionError("unreachable")
 
 
 def _complete_model(model: str, user_prompt: str, system_prompt: str) -> str:
