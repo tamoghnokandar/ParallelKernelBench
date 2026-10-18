@@ -628,7 +628,7 @@ def parse_args(argv: list[str] | None = None) -> KernelGenArgs:
 
     # Check that are args are valid:
     model = str(ns.model)                           # make sure model is allowed
-    if _provider_for_model(model) is None:
+    if not ns.print_prompt and _provider_for_model(model) is None:
         print(
             f"Error: --model must be one of: {allowed_help}, or openrouter/<org>/<model>",
             file=sys.stderr,
