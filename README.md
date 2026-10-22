@@ -295,6 +295,10 @@ This started as an internship project: we would greatly welcome contributions!
 
 ### Adding a problem
 
+Problems **88–92** add FlashInfer-inspired decode-context attention merging,
+mixed TP/DP communication, MoE finalization, and FP8 activation paths. See
+[task contracts, sources, and validation commands](reference/FLASHINFER_TASKS.md).
+
 1. Fix tensor shapes and allocation in `utils/input_output_tensors.py` (shared across backends).
 2. Define performance rules in `utils/performance.py` if needed.
 3. Add the reference under `reference/` and optional solutions under the appropriate `solutions_`* tree.

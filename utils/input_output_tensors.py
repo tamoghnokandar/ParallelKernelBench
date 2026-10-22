@@ -136,6 +136,16 @@ def _build_tp_cp_groups(tp_size: int):
     assert tp_group is not None and cp_group is not None
     return tp_group, cp_group, cp_size
  
+def _build_tp_dp_groups(tp_size: int):
+    """Problem 89: rank = dp_rank * tp_size + tp_rank.
+
+    This is the same rank grid as TP/CP, with the second axis used for DP.
+    Group creation happens once during input construction, outside timing.
+    """
+    tp_group, dp_group, _ = _build_tp_cp_groups(tp_size)
+    return tp_group, dp_group
+
+
 def _build_cp_pp_groups(pp_size: int):
     """
     Build CP / PP groups for problem 56, following Megatron order with TP=DP=1.
@@ -280,7 +290,7 @@ def create_input_tensor(
     Args:
         rank: Process rank (0..world_size-1)
         world_size: Total number of processes
-        problem_id: Problem ID (e.g. 1–87) from reference filename
+        problem_id: Problem ID (e.g. 1–92) from reference filename
         base_shape: Base tensor shape tuple (e.g., (M, N))
         dtype: Tensor data type
         trial: Non-negative index; changes RNG for problems that use random inputs (trial=0 is legacy behavior).
@@ -1876,6 +1886,83 @@ def create_input_tensor(
             padding,
             None,
         )
+
+    # 88: decode_cp_attention_merge
+    elif problem_id == 88:
+        _seed(problem_id, rank, trial)
+        batch = max(1, min(M // 64, 32))
+        heads = 8
+        head_dim = 64 if N < 2048 else 128
+        partial_out = torch.randn(
+            (batch, heads, world_size, head_dim), dtype=dtype, device=dev
+        )
+        lse = torch.randn((batch, heads, world_size), device=dev) * 8.0
+        # The first row has no KV contributions; other rows include empty
+        # shards and widely separated LSEs to exercise stable merging.
+        lse[:, 0, :] = float("-inf")
+        lse[:, 1, :] += 1000.0
+        if rank % 2 == 0:
+            lse[:, 2, :] = float("-inf")
+        if trial % 2:
+            lse = lse / math.log(2.0)
+        return (partial_out, lse.contiguous(), trial % 2 == 0, None)
+
+    # 89: mixed_tp_dp_allreduce_allgather
+    elif problem_id == 89:
+        _seed(problem_id, rank, trial)
+        # Exercise both 2x4 and 4x2 grids on eight GPUs across trials.
+        factors = [n for n in range(2, world_size) if world_size % n == 0]
+        tp_size = factors[trial % len(factors)] if factors else world_size
+        tp_group, dp_group = _build_tp_dp_groups(tp_size)
+        tokens = max(1, M // 8)
+        hidden = max(64, min(N, 4096))
+        partial = torch.randn((tokens, hidden), dtype=dtype, device=dev)
+        partial = partial + 0.1 * rank
+        return (partial.contiguous(), tp_group, dp_group)
+
+    # 90: moe_finalize_allreduce_residual_rmsnorm
+    elif problem_id == 90:
+        _seed(problem_id, rank, trial)
+        tokens = max(4, min(M // 8, 512))
+        hidden = max(64, min(N, 4096))
+        top_k = 2 if trial % 2 == 0 else 4
+        rows = tokens * top_k
+        expert_out = torch.randn((rows, hidden), dtype=dtype, device=dev) / math.sqrt(world_size)
+        mapping = torch.randperm(rows, device=dev).reshape(tokens, top_k)
+        missing = (torch.arange(rows, device=dev).reshape(tokens, top_k) + rank) % 7 == 0
+        mapping = mapping.masked_fill(missing, -1)
+        # Include a completely absent token on every rank.
+        mapping[0] = -1
+        # Metadata and residual are replicated; expert rows remain rank-local.
+        _seed(problem_id, 0, trial)
+        weights = torch.softmax(torch.randn((tokens, top_k), device=dev), dim=-1)
+        residual = torch.randn((tokens, hidden), dtype=dtype, device=dev)
+        gamma = 1.0 + 0.1 * torch.randn((hidden,), dtype=dtype, device=dev)
+        return (expert_out.contiguous(), mapping.contiguous(), weights, residual, gamma, 1e-6, None)
+
+    # 91: allreduce_residual_rmsnorm_fp8
+    elif problem_id == 91:
+        _seed(problem_id, rank, trial)
+        tokens = max(1, min(M // 8, 512))
+        hidden = max(64, min(N, 4096))
+        partial = torch.randn((tokens, hidden), dtype=dtype, device=dev) / math.sqrt(world_size)
+        partial[0] = 0
+        _seed(problem_id, 0, trial)
+        residual = torch.randn((tokens, hidden), dtype=dtype, device=dev)
+        residual[0] = 0
+        gamma = 1.0 + 0.1 * torch.randn((hidden,), dtype=dtype, device=dev)
+        return (partial.contiguous(), residual, gamma, 1e-6, None)
+
+    # 92: fp8_two_shot_activation_allreduce
+    elif problem_id == 92:
+        _seed(problem_id, rank, trial)
+        scale_group = 256
+        n = _round_up_multiple(max(1, M * N), world_size * scale_group)
+        activation = torch.randn((n,), dtype=dtype, device=dev)
+        # Zero groups and rank-dependent scales exercise both scaling stages.
+        activation[:scale_group] = 0
+        activation = activation * (2.0 ** (rank % 4))
+        return (activation.contiguous(), scale_group, None)
 
     # Default: standard shape
     return (torch.full(base_shape, val, dtype=dtype, device=dev),)
